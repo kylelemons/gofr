@@ -1,8 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 var (
@@ -20,134 +21,206 @@ var (
 	chuser   = flag.String("user", "", "User to whom to drop privileges after listening (if set)")
 )
 
-type BackendPath struct {
+type Backend struct {
 	Name string
-	Path string
-}
-type Mapping struct {
-	Path   string
-	Target *BackendPath
-	// Options
-}
-type Config struct {
-	Mappings []*Mapping
+	URL  *urlpkg.URL
 }
 
-func ParseConfig(r io.Reader) (*Config, error) {
-	var (
-		lines = bufio.NewReader(r)
-		cfg   = &Config{}
-		last  *Mapping
-	)
+// Route routes the original request to this backend.
+//
+// Route honors the following from original:
+//   Method            - Copied to request
+//   URL.Path          - Used to construct the backend path
+//   Header            - Used as basis for backend headers (subject to whitelisting)
+//   Body              - Copied to request (subject to size limits)
+//   ContentLength     - Copied to request
+//
+// Route also provides the following headers:
+//   X-Gofr-Forwarded-For       - Set to the RemoteAddr of the client
+//   X-Gofr-Requested-Host      - Set to the Host from the client
+//   X-Gofr-Backend             - Set to the name of the bakend the request is going to
+func (b *Backend) Route(w http.ResponseWriter, original *http.Request) error {
+	start := time.Now()
 
-	// line is nonzero in length and has been stripped of spaces and comments
-	process := func(lineno int, line string) {
-		fields := strings.Fields(line)
-		nField := len(fields)
-		switch {
-		case nField == 3 && fields[1] == "->":
-			backend := strings.Split(fields[2], ":")
-			if len(backend) != 2 {
-				log.Fatalf("config:%d: malformed backend %q: want name:/path", lineno, fields[2])
-			}
+	// Copy the URL
+	url := *b.URL
+	url.Path = pathpkg.Join(url.Path, original.URL.Path)
 
-			last = &Mapping{
-				Path: fields[0],
-				Target: &BackendPath{
-					Name: backend[0],
-					Path: backend[1],
-				},
-			}
-			cfg.Mappings = append(cfg.Mappings, last)
+	// Copy the headers
+	headers := http.Header{
+		"X-Gofr-Forwarded-For":  {original.RemoteAddr},
+		"X-Gofr-Requested-Host": {original.Host},
+		"X-Gofr-Backend":        {b.Name},
+	}
+	for hdr, val := range original.Header {
+		switch hdr {
+		// Pass through
+		case "Accept", "Accept-Language", "Content-Type":
+			fallthrough
+		case "Authorization", "Referer", "User-Agent", "Cookie":
+			fallthrough
+		case "ETag", "Etag", "Cache-Control":
+			fallthrough
+		case "If-Modified-Since", "If-Unmodified-Since", "If-Match", "If-None-Match":
+			headers[hdr] = val
+
+		// Silently ignore
+		case "Accept-Charset", "Accept-Encoding", "Accept-Datetime":
+			fallthrough
+		case "Content-MD5":
+			fallthrough
+		case "Via", "Connection":
+			// do nothing
+
+		// Otherwise, log a warning
+		default:
+			// TODO(kevlar): configurable additional whitelisting
+
+			log.Printf("%s: Blocking header %q: %q", b.Name, hdr, val)
 		}
 	}
 
-	for lineno := 0; ; lineno++ {
-		line, err := lines.ReadString('\n')
-		if idx := strings.Index(line, "#"); idx >= 0 {
-			line = line[:idx]
+	// Copy the request
+	req := &http.Request{
+		Method: original.Method,
+		URL:    &url,
+		Header: headers,
+
+		// TODO(kevlar): LimitReader and max request size
+		Body:          original.Body,
+		ContentLength: original.ContentLength,
+
+		// TODO(kevlar): Transfer encoding?
+	}
+
+	// Issue the backend request
+	resp, err := http.DefaultClient.Do(req) // TODO(kevlar): custom client with custom transport that sets max idle conns
+	if err != nil {
+		log.Printf("%s: routing %q to %q: backend error: %s", b.Name, original.URL, req.URL, err)
+
+		// TODO(kevlar): Better error pages
+		http.Error(w, "Backend Unavailable", http.StatusServiceUnavailable)
+		return nil
+	}
+	defer resp.Body.Close()
+
+	// Copy the header
+	for k, v := range resp.Header {
+		w.Header()[k] = v
+	}
+	w.WriteHeader(resp.StatusCode)
+
+	// Copy the response
+	if n, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("%s: error writing response after %d bytes: %s", b.Name, n, err)
+		return nil
+	}
+
+	log.Printf("%s: Successfully routed request from %q to %q in %s", b.Name, original.URL, req.URL, time.Since(start))
+	return nil
+}
+
+type Router interface {
+	Route(w http.ResponseWriter, original *http.Request) error
+}
+
+type rewriter struct {
+	Prefix, Path string
+	Backend      *Backend
+}
+
+func (r *rewriter) Route(w http.ResponseWriter, original *http.Request) error {
+	if !strings.HasPrefix(original.URL.Path, r.Prefix) {
+		return fmt.Errorf("path %q does not have prefix %q", original.URL, r.Prefix)
+	}
+	defer func(path string) {
+		original.URL.Path = path
+	}(original.URL.Path)
+	original.URL.Path = pathpkg.Join(r.Path, original.URL.Path[len(r.Prefix):])
+	return r.Backend.Route(w, original)
+}
+
+type Frontend struct {
+	Backends map[string]*Backend
+	Routes   map[string]Router
+}
+
+func (fe *Frontend) AddBackend(name string, url string) {
+	u, err := urlpkg.Parse(url)
+	if err != nil {
+		log.Panicf("invalid URL %q: %s", url, err)
+	}
+	if _, exist := fe.Backends[name]; exist {
+		log.Panicf("backend %q already exists", name)
+	}
+
+	if fe.Backends == nil {
+		fe.Backends = make(map[string]*Backend)
+	}
+	fe.Backends[name] = &Backend{
+		Name: name,
+		URL:  u,
+	}
+}
+
+func (fe *Frontend) AddRoute(prefix string, backend, backendPath string) {
+	// TODO(kevlar): don't inject a rewriter if prefix == backendPath
+	// and optimize the prefix == "/" and backendPath == "/" cases>
+	be, exist := fe.Backends[backend]
+	if !exist {
+		log.Panicf("unknown backend %q", backend)
+	}
+	if _, exist := fe.Routes[prefix]; exist {
+		log.Panicf("duplicate route %q", prefix)
+	}
+
+	if fe.Routes == nil {
+		fe.Routes = make(map[string]Router)
+	}
+	fe.Routes[prefix] = &rewriter{
+		Prefix:  prefix,
+		Backend: be,
+		Path:    backendPath,
+	}
+}
+
+func (fe *Frontend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Clean path
+	path := pathpkg.Clean(r.URL.Path)
+	r.URL.Path = path
+
+	var longest string
+	var route Router
+
+	for prefix, r := range fe.Routes {
+		if !strings.HasPrefix(path, prefix) {
+			continue
 		}
-		line = strings.TrimSpace(line)
-		if len(line) > 0 {
-			process(lineno, line)
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
+		if diff := len(prefix) - len(longest); diff > 0 || (diff == 0 && prefix < longest) {
+			longest, route = prefix, r
 		}
 	}
-	return cfg, nil
+
+	if route == nil {
+		// TODO(kevlar): better error pages
+		http.NotFound(w, r)
+		return
+	}
+
+	if err := route.Route(w, r); err != nil {
+		log.Printf("internal error: %s", err)
+	}
+
 }
 
 func main() {
 	flag.Parse()
 
-	var raw = strings.NewReader(`
-/ -> blog:/
-	`)
+	// DefaultMaxIdleConnsPerHost = 32
 
-	config, err := ParseConfig(raw)
-	if err != nil {
-		log.Fatalf("parse config: %s", err)
-	}
-
-	backends := map[string]*urlpkg.URL{
-		"blog": {
-			Scheme: "http",
-			Host:   "localhost:8001",
-			Path:   "/",
-		},
-	}
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		path := pathpkg.Clean(r.URL.Path)
-		for _, m := range config.Mappings {
-			if !strings.HasPrefix(path, m.Path) {
-				continue
-			}
-			be, ok := backends[m.Target.Name]
-			if !ok {
-				log.Printf("misconfigured mapping: backend %q does not exist", m.Target.Name)
-				http.NotFound(w, r)
-				return
-			}
-			// Copy the URL
-			url := *be
-			url.Path = pathpkg.Join(m.Target.Path, path[len(m.Path):])
-
-			// Copy the request
-			req := *r
-			req.URL = &url
-			req.RequestURI = ""
-
-			// Issue the backend request
-			resp, err := http.DefaultClient.Do(&req)
-			if err != nil {
-				log.Printf("routing %q to %q: backend error: %s", path, req.URL, err)
-				http.Error(w, "backend error", http.StatusInternalServerError)
-				return
-			}
-			defer resp.Body.Close()
-
-			// Copy the header
-			for k, v := range resp.Header {
-				w.Header()[k] = v
-			}
-			w.WriteHeader(resp.StatusCode)
-
-			// Copy the response
-			if n, err := io.Copy(w, resp.Body); err != nil {
-				log.Printf("error writing response after %d bytes: %s", n, err)
-				return
-			}
-
-			log.Printf("Successfully routed request from %q to %q", path, req.URL)
-			return
-		}
-		http.NotFound(w, r)
-	})
+	fe := new(Frontend)
+	fe.AddBackend("blog", "http://localhost:8001/")
+	fe.AddRoute("/", "blog", "/")
 
 	listener, err := net.Listen("tcp", *httpAddr)
 	if err != nil {
@@ -175,5 +248,5 @@ func main() {
 		}
 	}
 
-	log.Fatalf("serve: %s", http.Serve(listener, nil))
+	log.Fatalf("serve: %s", http.Serve(listener, fe))
 }
