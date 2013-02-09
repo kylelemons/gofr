@@ -10,6 +10,7 @@ import (
 	urlpkg "net/url"
 	"os/user"
 	pathpkg "path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 )
 
 var (
+	// TODO(kevlar): --log
 	httpAddr = flag.String("http", ":80", "Address on which to listen for HTTP")
 	chuser   = flag.String("user", "", "User to whom to drop privileges after listening (if set)")
 )
@@ -39,7 +41,8 @@ type Backend struct {
 //   X-Gofr-Forwarded-For       - Set to the RemoteAddr of the client
 //   X-Gofr-Requested-Host      - Set to the Host from the client
 //   X-Gofr-Backend             - Set to the name of the bakend the request is going to
-func (b *Backend) Route(w http.ResponseWriter, original *http.Request) error {
+//   X-Gofr-Stripped-Prefix     - Set to the directory corresponding to /
+func (b *Backend) Route(w http.ResponseWriter, original *http.Request, stripped string) error {
 	start := time.Now()
 
 	// Copy the URL
@@ -48,9 +51,10 @@ func (b *Backend) Route(w http.ResponseWriter, original *http.Request) error {
 
 	// Copy the headers
 	headers := http.Header{
-		"X-Gofr-Forwarded-For":  {original.RemoteAddr},
-		"X-Gofr-Requested-Host": {original.Host},
-		"X-Gofr-Backend":        {b.Name},
+		"X-Gofr-Forwarded-For":   {original.RemoteAddr},
+		"X-Gofr-Requested-Host":  {original.Host},
+		"X-Gofr-Backend":         {b.Name},
+		"X-Gofr-Stripped-Prefix": {stripped},
 	}
 	for hdr, val := range original.Header {
 		switch hdr {
@@ -121,7 +125,7 @@ func (b *Backend) Route(w http.ResponseWriter, original *http.Request) error {
 }
 
 type Router interface {
-	Route(w http.ResponseWriter, original *http.Request) error
+	Route(w http.ResponseWriter, original *http.Request, stripped string) error
 }
 
 type rewriter struct {
@@ -129,7 +133,7 @@ type rewriter struct {
 	Backend      *Backend
 }
 
-func (r *rewriter) Route(w http.ResponseWriter, original *http.Request) error {
+func (r *rewriter) Route(w http.ResponseWriter, original *http.Request, stripped string) error {
 	if !strings.HasPrefix(original.URL.Path, r.Prefix) {
 		return fmt.Errorf("path %q does not have prefix %q", original.URL, r.Prefix)
 	}
@@ -137,12 +141,37 @@ func (r *rewriter) Route(w http.ResponseWriter, original *http.Request) error {
 		original.URL.Path = path
 	}(original.URL.Path)
 	original.URL.Path = pathpkg.Join(r.Path, original.URL.Path[len(r.Prefix):])
-	return r.Backend.Route(w, original)
+	return r.Backend.Route(w, original, pathpkg.Clean(stripped+r.Prefix))
+}
+
+type dir struct {
+	Prefix, Dir string
+}
+
+func (d *dir) Route(w http.ResponseWriter, original *http.Request, stripped string) error {
+	file := filepath.Join(d.Dir, filepath.FromSlash(strings.TrimPrefix(original.URL.Path, d.Prefix)))
+	log.Printf("Serving %q from %q", original.URL, file)
+	http.ServeFile(w, original, file)
+	return nil
 }
 
 type Frontend struct {
 	Backends map[string]*Backend
 	Routes   map[string]Router
+}
+
+func (fe *Frontend) AddStatic(prefix, basedir string) {
+	if _, exist := fe.Routes[prefix]; exist {
+		log.Panicf("a handler for %q already exists", prefix)
+	}
+
+	if fe.Routes == nil {
+		fe.Routes = make(map[string]Router)
+	}
+	fe.Routes[prefix] = &dir{
+		Prefix: prefix,
+		Dir:    basedir,
+	}
 }
 
 func (fe *Frontend) AddBackend(name string, url string) {
@@ -207,10 +236,9 @@ func (fe *Frontend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := route.Route(w, r); err != nil {
+	if err := route.Route(w, r, ""); err != nil {
 		log.Printf("internal error: %s", err)
 	}
-
 }
 
 func main() {
@@ -219,8 +247,9 @@ func main() {
 	// DefaultMaxIdleConnsPerHost = 32
 
 	fe := new(Frontend)
+	fe.AddStatic("/static", "/d/www/static")
 	fe.AddBackend("blog", "http://localhost:8001/")
-	fe.AddRoute("/", "blog", "/")
+	fe.AddRoute("/blog", "blog", "/")
 
 	listener, err := net.Listen("tcp", *httpAddr)
 	if err != nil {
@@ -248,5 +277,6 @@ func main() {
 		}
 	}
 
+	log.Printf("Listening on %s", *httpAddr)
 	log.Fatalf("serve: %s", http.Serve(listener, fe))
 }
