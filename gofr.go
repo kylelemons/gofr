@@ -98,7 +98,7 @@ func (b *Backend) Route(w http.ResponseWriter, original *http.Request, stripped 
 	}
 
 	// Issue the backend request
-	resp, err := http.DefaultClient.Do(req) // TODO(kevlar): custom client with custom transport that sets max idle conns
+	resp, err := http.DefaultTransport.RoundTrip(req) // TODO(kevlar): custom client with custom transport that sets max idle conns
 	if err != nil {
 		log.Printf("%s: routing %q to %q: backend error: %s", b.Name, original.URL, req.URL, err)
 
