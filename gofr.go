@@ -144,6 +144,18 @@ func (r *rewriter) Route(w http.ResponseWriter, original *http.Request, stripped
 	return r.Backend.Route(w, original, pathpkg.Clean(stripped+r.Prefix))
 }
 
+type redirector struct {
+	Strip, Replace string
+}
+
+func (r *redirector) Route(w http.ResponseWriter, original *http.Request, stripped string) error {
+	loc := pathpkg.Join(r.Replace, strings.TrimPrefix(original.URL.Path, r.Strip))
+	w.Header().Set("Location", loc)
+	w.WriteHeader(http.StatusTemporaryRedirect)
+	fmt.Fprintf(w, "<html><body>click <a href=%q>here</a> if your browser doesn't redirect you</a></body></html", loc)
+	return nil
+}
+
 type dir struct {
 	Prefix, Dir string
 }
@@ -171,6 +183,20 @@ func (fe *Frontend) AddStatic(prefix, basedir string) {
 	fe.Routes[prefix] = &dir{
 		Prefix: prefix,
 		Dir:    basedir,
+	}
+}
+
+func (fe *Frontend) AddRedirect(prefix, replace string) {
+	if _, exist := fe.Routes[prefix]; exist {
+		log.Panicf("a handler for %q already exists", prefix)
+	}
+
+	if fe.Routes == nil {
+		fe.Routes = make(map[string]Router)
+	}
+	fe.Routes[prefix] = &redirector{
+		Strip:   prefix,
+		Replace: replace,
 	}
 }
 
@@ -247,6 +273,7 @@ func main() {
 	// DefaultMaxIdleConnsPerHost = 32
 
 	fe := new(Frontend)
+	fe.AddRedirect("/", "/blog")
 	fe.AddStatic("/static", "/d/www/static")
 	fe.AddBackend("blog", "http://localhost:8001/")
 	fe.AddRoute("/blog", "blog", "/")
