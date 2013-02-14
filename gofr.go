@@ -33,6 +33,7 @@ type Backend struct {
 // Route honors the following from original:
 //   Method            - Copied to request
 //   URL.Path          - Used to construct the backend path
+//   URL.RawQuery      - Used to construct the backend path
 //   Header            - Used as basis for backend headers (subject to whitelisting)
 //   Body              - Copied to request (subject to size limits)
 //   ContentLength     - Copied to request
@@ -48,6 +49,7 @@ func (b *Backend) Route(w http.ResponseWriter, original *http.Request, stripped 
 	// Copy the URL
 	url := *b.URL
 	url.Path = pathpkg.Join(url.Path, original.URL.Path)
+	url.RawQuery = original.URL.RawQuery
 
 	// Copy the headers
 	headers := http.Header{
