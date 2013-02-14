@@ -167,12 +167,7 @@ func (d *dir) Route(w http.ResponseWriter, original *http.Request, stripped stri
 	return nil
 }
 
-type Frontend struct {
-	Backends map[string]*Backend
-	Routes   map[string]Router
-}
-
-func (fe *Frontend) AddStatic(prefix, basedir string) {
+func (fe *Frontend) AddStaticDir(prefix, basedir string) {
 	if _, exist := fe.Routes[prefix]; exist {
 		log.Panicf("a handler for %q already exists", prefix)
 	}
@@ -184,6 +179,34 @@ func (fe *Frontend) AddStatic(prefix, basedir string) {
 		Prefix: prefix,
 		Dir:    basedir,
 	}
+}
+
+type file struct {
+	File string
+}
+
+func (f *file) Route(w http.ResponseWriter, original *http.Request, stripped string) error {
+	log.Printf("Serving %q from %q", original.URL, f.File)
+	http.ServeFile(w, original, f.File)
+	return nil
+}
+
+func (fe *Frontend) AddStaticFile(urlpath, realpath string) {
+	if _, exist := fe.Routes[urlpath]; exist {
+		log.Panicf("a handler for %q already exists", urlpath)
+	}
+
+	if fe.Routes == nil {
+		fe.Routes = make(map[string]Router)
+	}
+	fe.Routes[urlpath] = &file{
+		File: realpath,
+	}
+}
+
+type Frontend struct {
+	Backends map[string]*Backend
+	Routes   map[string]Router
 }
 
 func (fe *Frontend) AddRedirect(prefix, replace string) {
@@ -267,16 +290,22 @@ func (fe *Frontend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func setup() *Frontend {
+	fe := new(Frontend)
+	fe.AddRedirect("/", "/blog")
+	fe.AddStaticFile("/robots.txt", "/d/www/static/robots.txt")
+	fe.AddStaticDir("/static", "/d/www/static")
+	fe.AddStaticDir("/download", "/d/www/download")
+	fe.AddBackend("blog", "http://localhost:8001/")
+	fe.AddRoute("/blog", "blog", "/")
+	return fe
+}
+
 func main() {
 	flag.Parse()
 
 	// DefaultMaxIdleConnsPerHost = 32
-
-	fe := new(Frontend)
-	fe.AddRedirect("/", "/blog")
-	fe.AddStatic("/static", "/d/www/static")
-	fe.AddBackend("blog", "http://localhost:8001/")
-	fe.AddRoute("/blog", "blog", "/")
+	fe := setup()
 
 	listener, err := net.Listen("tcp", *httpAddr)
 	if err != nil {
