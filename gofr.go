@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
@@ -8,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	urlpkg "net/url"
+	"os"
+	"os/signal"
 	"os/user"
 	pathpkg "path"
 	"path/filepath"
@@ -18,9 +21,15 @@ import (
 )
 
 var (
-	// TODO(kevlar): --log
+	accessFile = flag.String("access", "access.log", "Path to the access log")
+	logFile    = flag.String("log", "gofr.log", "Path to the gofr log")
+
 	httpAddr = flag.String("http", ":80", "Address on which to listen for HTTP")
 	chuser   = flag.String("user", "", "User to whom to drop privileges after listening (if set)")
+
+	httpsAddr = flag.String("https", ":443", "Address on which to listen for HTTPS")
+	certFile  = flag.String("cert", "/d/ssl/kylelemons.net.cert", "File containing SSL certificate(s)")
+	keyFile   = flag.String("key", "/d/ssl/kylelemons.net.key", "File containing SSL key")
 )
 
 type Backend struct {
@@ -264,7 +273,44 @@ func (fe *Frontend) AddRoute(prefix string, backend, backendPath string) {
 	}
 }
 
-func (fe *Frontend) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+type rwlogger struct {
+	code  int
+	bytes int
+	http.ResponseWriter
+}
+
+func (w *rwlogger) WriteHeader(code int) {
+	w.code = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *rwlogger) Write(b []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += n
+	return n, err
+}
+
+func (fe *Frontend) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
+	w := &rwlogger{200, 0, rw}
+	now := time.Now().Format("[02/Jan/2006:15:04:05 -0700]")
+	defer func() {
+		// access log format: "%h %l %u %t \"%r\" %>s %b"
+		addr := r.RemoteAddr
+		if colon := strings.Index(addr, ":"); colon >= 0 {
+			addr = addr[:colon]
+		}
+		user := "-"
+		if r.URL.User != nil {
+			user = r.URL.User.Username()
+		}
+		firstLine := fmt.Sprintf("%s %s %s", r.Method, r.URL, r.Proto)
+		bytes := "-"
+		if w.bytes > 0 {
+			bytes = fmt.Sprintf("%d", w.bytes)
+		}
+		access.Printf("%s - %s %s %q %d %s", addr, user, now, firstLine, w.code, bytes)
+	}()
+
 	// Clean path
 	path := pathpkg.Clean(r.URL.Path)
 	r.URL.Path = path
@@ -305,15 +351,58 @@ func setup() *Frontend {
 	return fe
 }
 
+var access *log.Logger
+
 func main() {
 	flag.Parse()
+
+	logOut, err := os.OpenFile(*logFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+	if err != nil {
+		log.Fatalf("open log: %s", err)
+	}
+	defer logOut.Close()
+
+	log.Printf("Logging to %s", *logFile)
+	log.SetOutput(logOut)
+	log.Printf("Logging started for PID %d", os.Getpid())
+
+	accessOut, err := os.OpenFile(*accessFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
+	if err != nil {
+		log.Fatalf("open access log: %s", err)
+	}
+	defer accessOut.Close()
+
+	log.Printf("Writing access log to %s", *accessFile)
+	access = log.New(accessOut, "", 0)
 
 	// DefaultMaxIdleConnsPerHost = 32
 	fe := setup()
 
-	listener, err := net.Listen("tcp", *httpAddr)
+	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
+	if err != nil {
+		log.Fatalf("loadX509: %s", err)
+	}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		CipherSuites: []uint16{
+			tls.TLS_RSA_WITH_RC4_128_SHA,
+			tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA,
+			tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+			tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
+		},
+		PreferServerCipherSuites: true,
+	}
+
+	httpSock, err := net.Listen("tcp", *httpAddr)
 	if err != nil {
 		log.Fatalf("listen(%q): %s", *httpAddr, err)
+	}
+
+	httpsSock, err := tls.Listen("tcp", *httpsAddr, tlsConfig)
+	if err != nil {
+		log.Fatalf("listen(%q): %s", *httpsAddr, err)
 	}
 
 	if username := *chuser; len(username) > 0 {
@@ -337,6 +426,20 @@ func main() {
 		}
 	}
 
-	log.Printf("Listening on %s", *httpAddr)
-	log.Fatalf("serve: %s", http.Serve(listener, fe))
+	go func() {
+		log.Printf("Listening on %s", *httpAddr)
+		log.Fatalf("http: %s", http.Serve(httpSock, fe))
+	}()
+	go func() {
+		log.Printf("Listening on %s [SSL]", *httpsAddr)
+		log.Fatalf("serve: %s", http.Serve(httpsSock, fe))
+	}()
+
+	incoming := make(chan os.Signal)
+	signal.Notify(incoming)
+	for sig := range incoming {
+		log.Printf("Received %s", sig)
+		break
+	}
+	log.Printf("Logging complete for PID %d", os.Getpid())
 }
