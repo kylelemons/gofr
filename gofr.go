@@ -308,7 +308,18 @@ func (fe *Frontend) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		if w.bytes > 0 {
 			bytes = fmt.Sprintf("%d", w.bytes)
 		}
-		access.Printf("%s - %s %s %q %d %s", addr, user, now, firstLine, w.code, bytes)
+		full := r.URL.Path
+		if r.Host != "" {
+			u := *r.URL
+			u.Host = r.Host
+			u.Scheme = "http"
+			if r.TLS != nil {
+				u.Scheme = "https"
+			}
+			full = u.String()
+		}
+		useragent := r.Header.Get("User-Agent")
+		access.Printf("%s - %s %s %q %d %s %q %q", addr, user, now, firstLine, w.code, bytes, full, useragent)
 	}()
 
 	// Clean path
