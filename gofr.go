@@ -363,7 +363,7 @@ func setup() *Frontend {
 	return fe
 }
 
-var access *log.Logger
+var access = log.New(os.Stderr, "", 0)
 
 func main() {
 	flag.Parse()
