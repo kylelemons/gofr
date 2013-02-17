@@ -353,6 +353,7 @@ func setup() *Frontend {
 	fe := new(Frontend)
 	fe.AddRedirect("/", "/blog")
 	fe.AddStaticFile("/robots.txt", "/d/www/static/robots.txt")
+	fe.AddStaticFile("/favicon.ico", "/d/www/static/favicon.ico")
 	fe.AddStaticDir("/static", "/d/www/static")
 	fe.AddStaticDir("/download", "/d/www/download")
 	fe.AddBackend("blog", "http://localhost:8001/")
