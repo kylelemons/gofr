@@ -1,12 +1,17 @@
 package main
 
 import (
+	"flag"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+)
+
+var (
+	live = flag.String("live", "", `If specified, tests live server (e.g. "http://example.com/")`)
 )
 
 func TestURLs(t *testing.T) {
@@ -17,9 +22,12 @@ func TestURLs(t *testing.T) {
 
 	codes, good, total := map[int]int{200: 0}, 0, 0
 
-	fe := setup()
-	ts := httptest.NewServer(fe)
-	defer ts.Close()
+	base := *live
+	if base == "" {
+		fe := setup()
+		ts := httptest.NewServer(fe)
+		defer ts.Close()
+	}
 
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
@@ -33,7 +41,7 @@ func TestURLs(t *testing.T) {
 			t.Errorf("bad URL line %q", line)
 			continue
 		}
-		method, path := pieces[0], ts.URL+pieces[1]
+		method, path := pieces[0], base+pieces[1]
 
 		req, err := http.NewRequest(method, path, nil)
 		if err != nil {

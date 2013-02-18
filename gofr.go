@@ -377,6 +377,7 @@ func main() {
 	log.Printf("Logging to %s", *logFile)
 	log.SetOutput(logOut)
 	log.Printf("Logging started for PID %d", os.Getpid())
+	defer log.Printf("Logging complete for PID %d", os.Getpid())
 
 	accessOut, err := os.OpenFile(*accessFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
 	if err != nil {
@@ -450,8 +451,11 @@ func main() {
 	incoming := make(chan os.Signal)
 	signal.Notify(incoming)
 	for sig := range incoming {
-		log.Printf("Received %s", sig)
-		break
+		switch sig {
+		case syscall.SIGTERM, syscall.SIGINT:
+			return
+		default:
+			log.Printf("Received signal %q", sig)
+		}
 	}
-	log.Printf("Logging complete for PID %d", os.Getpid())
 }
