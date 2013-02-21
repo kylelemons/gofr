@@ -358,8 +358,10 @@ func setup() *Frontend {
 	fe.AddStaticDir("/download", "/d/www/download")
 	fe.AddBackend("blog", "http://localhost:8001/")
 	fe.AddBackend("vanitypkg", "http://localhost:8002/")
+	fe.AddBackend("gitweb", "http://localhost:8003/")
 	fe.AddRoute("/blog", "blog", "/")
 	fe.AddRoute("/go", "vanitypkg", "/")
+	fe.AddRoute("/browse", "gitweb", "/")
 	return fe
 }
 
