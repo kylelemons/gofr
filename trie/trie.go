@@ -4,7 +4,12 @@ import (
 	"net/http"
 	pathpkg "path"
 	"strings"
+	"unicode/utf8"
+
+	"fmt"
 )
+
+var _ = fmt.Print
 
 func splitFields(full string, s string) []string {
 	full = strings.TrimPrefix(full, s)
@@ -43,7 +48,9 @@ func (t *domainTrie) find(segs []string) (int, *pathTrie) {
 
 type pathTrie struct {
 	child [28]*pathTrie
-	leaf  http.Handler
+
+	name string       // without trailing slashes
+	leaf http.Handler // handler for this file/dir
 }
 
 func runeIdx(r rune) int {
@@ -59,23 +66,35 @@ func runeIdx(r rune) int {
 	return 27
 }
 
-func (t *pathTrie) find(path string) (sub int, last http.Handler) {
+func (t *pathTrie) find(path string) (sub int, dir bool, name string, last http.Handler) {
 	s := strings.TrimPrefix(path, "/")
 	add := len(path) - len(s)
 
-	last = t.leaf
+	dir, last = add > 0, t.leaf
 	for i, r := range s {
-		// TODO(kevlar): handle directories
 		next := t.child[runeIdx(r)]
 		if next == nil {
 			break
 		}
 		t = next
 		if t.leaf != nil {
-			sub, last = i+1, t.leaf
+			sub, dir, name, last = i+add, r == '/', t.name, t.leaf
+			if !dir {
+				sub += utf8.RuneLen(r)
+			}
 		}
 	}
-	return add + sub, last
+
+	matched, extra := path[:sub], path[sub:]
+	if matched != name {
+		last = nil
+	} else if len(extra) > 0 {
+		if !dir || extra[0] != '/' {
+			last = nil
+		}
+	}
+
+	return sub, dir, name, last
 }
 
 type ServeMux struct {
@@ -90,9 +109,17 @@ func (s *ServeMux) HandleFunc(pattern string, handler func(http.ResponseWriter, 
 }
 
 func (s *ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// TODO(kevlar): Direct trie? splitFields is the long tail
 	domain := splitFields(r.Host, ".")
 	_, path := s.domain.find(domain)
+
 	clean := pathpkg.Clean(r.URL.Path)
-	_, handler := path.find(clean)
+	_, _, _, handler := path.find(clean)
+	if handler == nil {
+		// TODO(kevlar): User-defined error pages?
+		http.NotFound(w, r)
+		return
+	}
+
 	handler.ServeHTTP(w, r)
 }

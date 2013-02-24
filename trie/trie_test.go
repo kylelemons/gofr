@@ -46,6 +46,17 @@ var (
 					'o' - 'a': {
 						child: [28]*pathTrie{
 							'o' - 'a': {
+								child: [28]*pathTrie{
+									26: {
+										name: "/foo",
+										leaf: textHandler("root /foo/"),
+									},
+									27: {
+										name: "/foo!",
+										leaf: textHandler("root /foo!"),
+									},
+								},
+								name: "/foo",
 								leaf: textHandler("root /foo"),
 							},
 						},
@@ -63,6 +74,7 @@ var (
 					'a' - 'a': {
 						child: [28]*pathTrie{
 							'r' - 'a': {
+								name: "/bar",
 								leaf: textHandler("kylelemons.net /bar"),
 							},
 						},
@@ -70,6 +82,7 @@ var (
 					'o' - 'a': {
 						child: [28]*pathTrie{
 							'o' - 'a': {
+								name: "/boo",
 								leaf: textHandler("kylelemons.net /boo"),
 							},
 						},
@@ -129,12 +142,14 @@ var (
 		base  *pathTrie
 		path  string
 		count int
+		dir   bool
 		found string
 	}{
 		{
 			base:  root,
 			path:  "/",
-			count: 1,
+			count: 0,
+			dir:   true,
 			found: "root /",
 		},
 		{
@@ -145,33 +160,54 @@ var (
 		},
 		{
 			base:  root,
+			path:  "/foo/",
+			count: 4,
+			dir:   true,
+			found: "root /foo/",
+		},
+		{
+			base:  root,
+			path:  "/foo!",
+			count: 5,
+			found: "root /foo!",
+		},
+		{
+			base:  root,
 			path:  "/foo/bar",
 			count: 4,
-			found: "root /foo",
+			dir:   true,
+			found: "root /foo/",
 		},
 		{
 			base:  kylelemons_net,
 			path:  "/",
-			count: 1,
+			count: 0,
+			dir:   true,
 			found: "kylelemons.net /",
 		},
 		{
 			base:  kylelemons_net,
 			path:  "/ba",
-			count: 1,
+			count: 0,
+			dir:   true,
 			found: "kylelemons.net /",
 		},
 		{
 			base:  kylelemons_net,
 			path:  "/bo",
-			count: 1,
+			count: 0,
+			dir:   true,
 			found: "kylelemons.net /",
 		},
 		{
 			base:  kylelemons_net,
 			path:  "/bar/bar",
 			count: 4,
-			found: "kylelemons.net /bar",
+		},
+		{
+			base:  kylelemons_net,
+			path:  "/BAR",
+			count: 4,
 		},
 	}
 )
@@ -204,11 +240,14 @@ func BenchmarkDomainFind(b *testing.B) {
 
 func TestPathFind(t *testing.T) {
 	for _, test := range PathFindTests {
-		count, found := test.base.find(test.path)
+		count, dir, _, found := test.base.find(test.path)
 		if got, want := count, test.count; got != want {
 			t.Errorf("find(%q).count = %v, want %v", test.path, got, want)
 		}
-		if got, want := found, textHandler(test.found); got != want {
+		if got, want := dir, test.dir; got != want {
+			t.Errorf("find(%q).dir = %v, want %v", test.path, got, want)
+		}
+		if got, want := found, textHandler(test.found); want != "" && got != want {
 			t.Errorf("find(%q).found = %q, want %q", test.path, got, want)
 		}
 	}
@@ -236,7 +275,7 @@ func makeBenchmarkData() (hosts, paths []string, reqs []*http.Request) {
 			continue
 		}
 		for _, p := range PathFindTests {
-			if p.base != d.found {
+			if p.found == "" || p.base != d.found {
 				continue
 			}
 
