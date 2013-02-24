@@ -48,8 +48,9 @@ var (
 							'o' - 'a': {
 								child: [28]*pathTrie{
 									26: {
-										name: "/foo",
-										leaf: textHandler("root /foo/"),
+										name:  "/foo",
+										leaf:  textHandler("root /foo/"),
+										strip: true,
 									},
 									27: {
 										name: "/foo!",
@@ -143,6 +144,8 @@ var (
 		path  string
 		count int
 		dir   bool
+		strip bool
+		name  string
 		found string
 	}{
 		{
@@ -156,6 +159,7 @@ var (
 			base:  root,
 			path:  "/foo",
 			count: 4,
+			name:  "/foo",
 			found: "root /foo",
 		},
 		{
@@ -163,12 +167,15 @@ var (
 			path:  "/foo/",
 			count: 4,
 			dir:   true,
+			strip: true,
+			name:  "/foo",
 			found: "root /foo/",
 		},
 		{
 			base:  root,
 			path:  "/foo!",
 			count: 5,
+			name:  "/foo!",
 			found: "root /foo!",
 		},
 		{
@@ -176,6 +183,8 @@ var (
 			path:  "/foo/bar",
 			count: 4,
 			dir:   true,
+			strip: true,
+			name:  "/foo",
 			found: "root /foo/",
 		},
 		{
@@ -203,11 +212,13 @@ var (
 			base:  kylelemons_net,
 			path:  "/bar/bar",
 			count: 4,
+			name:  "/bar",
 		},
 		{
 			base:  kylelemons_net,
 			path:  "/BAR",
 			count: 4,
+			name:  "/bar",
 		},
 	}
 )
@@ -240,12 +251,18 @@ func BenchmarkDomainFind(b *testing.B) {
 
 func TestPathFind(t *testing.T) {
 	for _, test := range PathFindTests {
-		count, dir, _, found := test.base.find(test.path)
+		count, dir, strip, name, found := test.base.find(test.path)
 		if got, want := count, test.count; got != want {
 			t.Errorf("find(%q).count = %v, want %v", test.path, got, want)
 		}
 		if got, want := dir, test.dir; got != want {
 			t.Errorf("find(%q).dir = %v, want %v", test.path, got, want)
+		}
+		if got, want := strip, test.strip; got != want {
+			t.Errorf("find(%q).strip = %v, want %v", test.path, got, want)
+		}
+		if got, want := name, test.name; got != want {
+			t.Errorf("find(%q).name = %v, want %v", test.path, got, want)
 		}
 		if got, want := found, textHandler(test.found); want != "" && got != want {
 			t.Errorf("find(%q).found = %q, want %q", test.path, got, want)

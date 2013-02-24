@@ -49,8 +49,9 @@ func (t *domainTrie) find(segs []string) (int, *pathTrie) {
 type pathTrie struct {
 	child [28]*pathTrie
 
-	name string       // without trailing slashes
-	leaf http.Handler // handler for this file/dir
+	name  string       // without trailing slashes
+	leaf  http.Handler // handler for this file/dir
+	strip bool         // whether to strip this prefix
 }
 
 func runeIdx(r rune) int {
@@ -66,7 +67,7 @@ func runeIdx(r rune) int {
 	return 27
 }
 
-func (t *pathTrie) find(path string) (sub int, dir bool, name string, last http.Handler) {
+func (t *pathTrie) find(path string) (sub int, dir, strip bool, name string, last http.Handler) {
 	s := strings.TrimPrefix(path, "/")
 	add := len(path) - len(s)
 
@@ -78,7 +79,7 @@ func (t *pathTrie) find(path string) (sub int, dir bool, name string, last http.
 		}
 		t = next
 		if t.leaf != nil {
-			sub, dir, name, last = i+add, r == '/', t.name, t.leaf
+			sub, dir, strip, name, last = i+add, r == '/', t.strip, t.name, t.leaf
 			if !dir {
 				sub += utf8.RuneLen(r)
 			}
@@ -94,7 +95,7 @@ func (t *pathTrie) find(path string) (sub int, dir bool, name string, last http.
 		}
 	}
 
-	return sub, dir, name, last
+	return sub, dir, strip, name, last
 }
 
 type ServeMux struct {
@@ -102,7 +103,10 @@ type ServeMux struct {
 }
 
 func (s *ServeMux) Handle(pattern string, handler http.Handler) {
+	// TODO(kevlar): s.insert
 }
+
+// TODO(kevlar): SubHandle, like handle but with strip = true
 
 func (s *ServeMux) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
 	s.Handle(pattern, http.HandlerFunc(handler))
@@ -114,12 +118,19 @@ func (s *ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, path := s.domain.find(domain)
 
 	clean := pathpkg.Clean(r.URL.Path)
-	_, _, _, handler := path.find(clean)
+	matched, _, strip, _, handler := path.find(clean)
 	if handler == nil {
 		// TODO(kevlar): User-defined error pages?
 		http.NotFound(w, r)
 		return
 	}
+	if strip {
+		clean = clean[matched:]
+	}
+	if clean == "" {
+		clean = "/"
+	}
+	r.URL.Path = clean
 
 	handler.ServeHTTP(w, r)
 }
