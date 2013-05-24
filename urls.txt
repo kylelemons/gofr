@@ -31,6 +31,7 @@ GET /download/GoGenericsProposal.pdf
 GET /download/More_Than_You_Ever_Wanted_to_Know_About_Pointers_v3.pdf
 GET /download/efficient_hashing_with_lookups_in_two_memory_accesses.pdf
 GET /download/pointers.pdf
+GET /static/Polymer/polymer/polymer.js
 GET /go
 GET /go/rx
 GET /go/rx/graph

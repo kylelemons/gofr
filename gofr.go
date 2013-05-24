@@ -5,31 +5,30 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
-	"net"
+	logpkg "log"
 	"net/http"
 	urlpkg "net/url"
 	"os"
-	"os/signal"
-	"os/user"
 	pathpkg "path"
-	"path/filepath"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
+
+	"kylelemons.net/go/daemon"
+	"kylelemons.net/go/gofr/static"
 )
 
 var (
+	lameDuck = flag.Duration("lame-duck", 5*time.Second, "Amount of time to wait for lingering connections to close")
+
 	accessFile = flag.String("access", "access.log", "Path to the access log")
-	logFile    = flag.String("log", "gofr.log", "Path to the gofr log")
 
-	httpAddr = flag.String("http", ":80", "Address on which to listen for HTTP")
-	chuser   = flag.String("user", "", "User to whom to drop privileges after listening (if set)")
+	certFile = flag.String("cert", "/d/ssl/kylelemons.net.cert", "File containing SSL certificate(s)")
+	keyFile  = flag.String("key", "/d/ssl/kylelemons.net.key", "File containing SSL key")
 
-	httpsAddr = flag.String("https", ":443", "Address on which to listen for HTTPS")
-	certFile  = flag.String("cert", "/d/ssl/kylelemons.net.cert", "File containing SSL certificate(s)")
-	keyFile   = flag.String("key", "/d/ssl/kylelemons.net.key", "File containing SSL key")
+	logFile = daemon.LogFileFlag("log", 0644)
+	web     = daemon.ListenFlag("http", "tcp", ":80", "HTTP")
+	ssl     = daemon.ListenFlag("https", "tcp", ":443", "HTTPS")
+	privs   = daemon.PrivilegesFlag("user", "")
 )
 
 type Backend struct {
@@ -91,7 +90,7 @@ func (b *Backend) Route(w http.ResponseWriter, original *http.Request, stripped 
 		default:
 			// TODO(kevlar): configurable additional whitelisting
 
-			log.Printf("%s: Blocking header %q: %q", b.Name, hdr, val)
+			daemon.Verbose.Printf("%s: Blocking header %q: %q", b.Name, hdr, val)
 		}
 	}
 
@@ -111,7 +110,7 @@ func (b *Backend) Route(w http.ResponseWriter, original *http.Request, stripped 
 	// Issue the backend request
 	resp, err := http.DefaultTransport.RoundTrip(req) // TODO(kevlar): custom client with custom transport that sets max idle conns
 	if err != nil {
-		log.Printf("%s: routing %q to %q: backend error: %s", b.Name, original.URL, req.URL, err)
+		daemon.Verbose.Printf("%s: routing %q to %q: backend error: %s", b.Name, original.URL, req.URL, err)
 
 		// TODO(kevlar): Better error pages
 		http.Error(w, "Backend Unavailable", http.StatusServiceUnavailable)
@@ -127,11 +126,11 @@ func (b *Backend) Route(w http.ResponseWriter, original *http.Request, stripped 
 
 	// Copy the response
 	if n, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("%s: error writing response after %d bytes: %s", b.Name, n, err)
+		daemon.Verbose.Printf("%s: error writing response after %d bytes: %s", b.Name, n, err)
 		return nil
 	}
 
-	log.Printf("%s: Successfully routed request from %q to %q in %s", b.Name, original.URL, req.URL, time.Since(start))
+	daemon.Verbose.Printf("%s: Successfully routed request from %q to %q in %s", b.Name, original.URL, req.URL, time.Since(start))
 	return nil
 }
 
@@ -167,52 +166,14 @@ func (r *redirector) Route(w http.ResponseWriter, original *http.Request, stripp
 	return nil
 }
 
-type dir struct {
-	Prefix, Dir string
+type handler struct {
+	Prefix string
+	http.Handler
 }
 
-func (d *dir) Route(w http.ResponseWriter, original *http.Request, stripped string) error {
-	file := filepath.Join(d.Dir, filepath.FromSlash(strings.TrimPrefix(original.URL.Path, d.Prefix)))
-	log.Printf("Serving %q from %q", original.URL, file)
-	http.ServeFile(w, original, file)
+func (h *handler) Route(w http.ResponseWriter, r *http.Request, stripped string) error {
+	h.ServeHTTP(w, r)
 	return nil
-}
-
-func (fe *Frontend) AddStaticDir(prefix, basedir string) {
-	if _, exist := fe.Routes[prefix]; exist {
-		log.Panicf("a handler for %q already exists", prefix)
-	}
-
-	if fe.Routes == nil {
-		fe.Routes = make(map[string]Router)
-	}
-	fe.Routes[prefix] = &dir{
-		Prefix: prefix,
-		Dir:    basedir,
-	}
-}
-
-type file struct {
-	File string
-}
-
-func (f *file) Route(w http.ResponseWriter, original *http.Request, stripped string) error {
-	log.Printf("Serving %q from %q", original.URL, f.File)
-	http.ServeFile(w, original, f.File)
-	return nil
-}
-
-func (fe *Frontend) AddStaticFile(urlpath, realpath string) {
-	if _, exist := fe.Routes[urlpath]; exist {
-		log.Panicf("a handler for %q already exists", urlpath)
-	}
-
-	if fe.Routes == nil {
-		fe.Routes = make(map[string]Router)
-	}
-	fe.Routes[urlpath] = &file{
-		File: realpath,
-	}
 }
 
 type Frontend struct {
@@ -220,9 +181,22 @@ type Frontend struct {
 	Routes   map[string]Router
 }
 
+func (fe *Frontend) Handle(prefix string, h http.Handler) {
+	if _, exist := fe.Routes[prefix]; exist {
+		daemon.Fatal.Printf("a handler for %q already exists", prefix)
+	}
+
+	if fe.Routes == nil {
+		fe.Routes = make(map[string]Router)
+	}
+	fe.Routes[prefix] = &handler{
+		Handler: h,
+	}
+}
+
 func (fe *Frontend) AddRedirect(prefix, replace string) {
 	if _, exist := fe.Routes[prefix]; exist {
-		log.Panicf("a handler for %q already exists", prefix)
+		daemon.Fatal.Printf("a handler for %q already exists", prefix)
 	}
 
 	if fe.Routes == nil {
@@ -237,10 +211,10 @@ func (fe *Frontend) AddRedirect(prefix, replace string) {
 func (fe *Frontend) AddBackend(name string, url string) {
 	u, err := urlpkg.Parse(url)
 	if err != nil {
-		log.Panicf("invalid URL %q: %s", url, err)
+		daemon.Fatal.Printf("invalid URL %q: %s", url, err)
 	}
 	if _, exist := fe.Backends[name]; exist {
-		log.Panicf("backend %q already exists", name)
+		daemon.Fatal.Printf("backend %q already exists", name)
 	}
 
 	if fe.Backends == nil {
@@ -257,10 +231,10 @@ func (fe *Frontend) AddRoute(prefix string, backend, backendPath string) {
 	// and optimize the prefix == "/" and backendPath == "/" cases>
 	be, exist := fe.Backends[backend]
 	if !exist {
-		log.Panicf("unknown backend %q", backend)
+		daemon.Fatal.Printf("unknown backend %q", backend)
 	}
 	if _, exist := fe.Routes[prefix]; exist {
-		log.Panicf("duplicate route %q", prefix)
+		daemon.Fatal.Printf("duplicate route %q", prefix)
 	}
 
 	if fe.Routes == nil {
@@ -292,8 +266,10 @@ func (w *rwlogger) Write(b []byte) (int, error) {
 
 func (fe *Frontend) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	w := &rwlogger{200, 0, rw}
-	now := time.Now().Format("[02/Jan/2006:15:04:05 -0700]")
+	start := time.Now()
 	defer func() {
+		now := start.Format("[02/Jan/2006:15:04:05 -0700]")
+
 		// access log format: "%h %l %u %t \"%r\" %>s %b"
 		addr := r.RemoteAddr
 		if colon := strings.Index(addr, ":"); colon >= 0 {
@@ -345,17 +321,17 @@ func (fe *Frontend) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := route.Route(w, r, ""); err != nil {
-		log.Printf("internal error: %s", err)
+		daemon.Error.Printf("internal error: %s", err)
 	}
 }
 
 func setup() *Frontend {
 	fe := new(Frontend)
 	fe.AddRedirect("/", "/blog")
-	fe.AddStaticFile("/robots.txt", "/d/www/static/robots.txt")
-	fe.AddStaticFile("/favicon.ico", "/d/www/static/favicon.ico")
-	fe.AddStaticDir("/static", "/d/www/static")
-	fe.AddStaticDir("/download", "/d/www/download")
+	fe.Handle("/robots.txt", static.File("/d/www/static/robots.txt"))
+	fe.Handle("/favicon.ico", static.File("/d/www/static/favicon.ico"))
+	fe.Handle("/static", static.Dir("/d/www/static").Strip("/static"))
+	fe.Handle("/download", static.Dir("/d/www/download").Strip("/download"))
 	fe.AddBackend("blog", "http://localhost:8001/")
 	fe.AddBackend("vanitypkg", "http://localhost:8002/")
 	fe.AddBackend("gitweb", "http://localhost:8003/")
@@ -365,37 +341,29 @@ func setup() *Frontend {
 	return fe
 }
 
-var access = log.New(os.Stderr, "", 0)
+var access = logpkg.New(os.Stderr, "", 0)
 
 func main() {
 	flag.Parse()
 
-	logOut, err := os.OpenFile(*logFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatalf("open log: %s", err)
-	}
-	defer logOut.Close()
-
-	log.Printf("Logging to %s", *logFile)
-	log.SetOutput(logOut)
-	log.Printf("Logging started for PID %d", os.Getpid())
-	defer log.Printf("Logging complete for PID %d", os.Getpid())
+	daemon.LogLevel = daemon.Verbose
+	daemon.LameDuck = *lameDuck
 
 	accessOut, err := os.OpenFile(*accessFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
 	if err != nil {
-		log.Fatalf("open access log: %s", err)
+		daemon.Fatal.Printf("open access log: %s", err)
 	}
 	defer accessOut.Close()
 
-	log.Printf("Writing access log to %s", *accessFile)
-	access = log.New(accessOut, "", 0)
+	daemon.Info.Printf("Writing access log to %s", *accessFile)
+	access = logpkg.New(accessOut, "", 0)
 
 	// DefaultMaxIdleConnsPerHost = 32
 	fe := setup()
 
 	cert, err := tls.LoadX509KeyPair(*certFile, *keyFile)
 	if err != nil {
-		log.Fatalf("loadX509: %s", err)
+		daemon.Fatal.Printf("loadX509: %s", err)
 	}
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{cert},
@@ -410,54 +378,30 @@ func main() {
 		PreferServerCipherSuites: true,
 	}
 
-	httpSock, err := net.Listen("tcp", *httpAddr)
+	httpSock, err := web.Listen()
 	if err != nil {
-		log.Fatalf("listen(%q): %s", *httpAddr, err)
+		daemon.Fatal.Printf("listen(%q): %s", web, err)
 	}
 
-	httpsSock, err := tls.Listen("tcp", *httpsAddr, tlsConfig)
+	httpsRawSock, err := ssl.Listen()
 	if err != nil {
-		log.Fatalf("listen(%q): %s", *httpsAddr, err)
+		daemon.Fatal.Printf("listen(%q): %s", ssl, err)
 	}
+	httpsSock := tls.NewListener(httpsRawSock, tlsConfig)
 
-	if username := *chuser; len(username) > 0 {
-		usr, err := user.Lookup(username)
-		if err != nil {
-			log.Fatalf("failed to find user %q: %s", username, err)
-		}
-		uid, err := strconv.Atoi(usr.Uid)
-		if err != nil {
-			log.Fatalf("bad user ID %q: %s", uid, err)
-		}
-		gid, err := strconv.Atoi(usr.Gid)
-		if err != nil {
-			log.Fatalf("bad user ID %q: %s", uid, err)
-		}
-		if err := syscall.Setgid(gid); err != nil {
-			log.Fatalf("setgid(%d): %s", gid, err)
-		}
-		if err := syscall.Setuid(uid); err != nil {
-			log.Fatalf("setuid(%d): %s", uid, err)
-		}
-	}
+	// Drop privileges
+	privs.Drop()
 
 	go func() {
-		log.Printf("Listening on %s", *httpAddr)
-		log.Fatalf("http: %s", http.Serve(httpSock, fe))
+		if err := http.Serve(httpSock, fe); err != nil && err != daemon.ErrStopped {
+			daemon.Fatal.Printf("http: %s", err)
+		}
 	}()
 	go func() {
-		log.Printf("Listening on %s [SSL]", *httpsAddr)
-		log.Fatalf("serve: %s", http.Serve(httpsSock, fe))
+		if err := http.Serve(httpsSock, fe); err != nil && err != daemon.ErrStopped {
+			daemon.Fatal.Printf("https: %s", err)
+		}
 	}()
 
-	incoming := make(chan os.Signal)
-	signal.Notify(incoming)
-	for sig := range incoming {
-		switch sig {
-		case syscall.SIGTERM, syscall.SIGINT:
-			return
-		default:
-			log.Printf("Received signal %q", sig)
-		}
-	}
+	daemon.Run()
 }

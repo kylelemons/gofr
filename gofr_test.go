@@ -26,8 +26,10 @@ func TestURLs(t *testing.T) {
 	if base == "" {
 		fe := setup()
 		ts := httptest.NewServer(fe)
+		base = ts.URL
 		defer ts.Close()
 	}
+	t.Logf("Testing against %q...", base)
 
 	lines := strings.Split(string(data), "\n")
 	for _, line := range lines {
