@@ -47,7 +47,7 @@ func vaccuum(s []string) []string {
 type Trie struct {
 	Name  string       // path piece
 	Child []*Trie      // child tries
-	Leaf  http.Handler // handler for this file/dir or nil for 404
+	Leaf  http.Handler // handler for this file/dir or nil to use parent
 }
 
 type byName []*Trie
@@ -127,6 +127,9 @@ func (t *Trie) Insert(paths []string, leaf http.Handler) error {
 }
 
 // Domain serves the trie for a specific domain.
+//
+// Domains are the handlers registered for each domain
+// within a ServeMux.
 type Domain struct {
 	Trie
 }
@@ -174,7 +177,7 @@ type ServeMux struct {
 // given pattern.  In general, the pattern takes the following form:
 //   <domain>/<path>
 //
-// Both the domain and the path portions are optional
+// Both the domain and the path portions are optional.
 func (s *ServeMux) Handle(pattern string, handler http.Handler) {
 	// Split the pattern
 	pieces := strings.SplitAfter(pattern, "/")
