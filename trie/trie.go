@@ -12,139 +12,263 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package trie implements a variant of http.ServeMux that uses a trie
+// instead of a map.
 package trie
 
 import (
 	"net/http"
 	pathpkg "path"
+	"sort"
 	"strings"
-	"unicode/utf8"
 
 	"fmt"
 )
 
-var _ = fmt.Print
+func reverse(s []string) {
+	for i := 0; i < len(s)/2; i++ {
+		j := len(s) - i - 1
+		s[i], s[j] = s[j], s[i]
+	}
+}
 
-func splitFields(full string, s string) []string {
-	full = strings.TrimPrefix(full, s)
-	full = strings.TrimSuffix(full, s)
-	if full == "" {
+func vaccuum(s []string) []string {
+	for len(s) > 0 && s[0] == "" {
+		s = s[1:]
+	}
+	for len(s) > 0 && s[len(s)-1] == "" {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// A Trie can store a prefix tree of paths or a suffix tree of domains.
+// It is the basis for the Domain and ServeMux type.
+type Trie struct {
+	Name  string       // path piece
+	Child []*Trie      // child tries
+	Leaf  http.Handler // handler for this file/dir or nil for 404
+}
+
+type byName []*Trie
+
+func (v byName) Len() int           { return len(v) }
+func (v byName) Swap(i, j int)      { v[i], v[j] = v[j], v[i] }
+func (v byName) Less(i, j int) bool { return v[i].Name < v[j].Name }
+
+// Find attempts to find the deepest matching child of this Trie with a non-nil
+// Leaf and return the number of path segments required to reach it and the
+// Trie present at that location.
+func (t *Trie) Find(paths []string) (int, *Trie) {
+	if len(paths) == 0 {
+		return 0, t
+	}
+
+	search, piece := t.Child, paths[0]
+	for len(search) > 0 {
+		i := len(search) / 2
+		cur := search[i]
+		if piece == cur.Name {
+			n, found := cur.Find(paths[1:])
+			if found.Leaf != nil {
+				return n + 1, found
+			}
+			break
+		} else if piece < cur.Name {
+			search = search[:i]
+		} else {
+			search = search[i+1:]
+		}
+	}
+	return 0, t
+}
+
+// Insert inserts the given handler in the trie at the given path and returns
+// an error if it could not be inserted (usually because it already existed).
+func (t *Trie) Insert(paths []string, leaf http.Handler) error {
+	if len(paths) == 0 {
+		if t.Leaf != nil {
+			return fmt.Errorf("%s: leaf already exists", t.Name)
+		}
+		t.Leaf = leaf
 		return nil
 	}
-	return strings.Split(full, s)
-}
 
-type domainPiece struct {
-	piece string
-	child domainTrie
-}
+	next := paths[0]
 
-type domainTrie struct {
-	child []*domainPiece
-	leaf  *pathTrie
-}
-
-// find finds the given segments in the domain trie and returns
-// how many were used and the leaf *pathTrie.
-func (t *domainTrie) find(segs []string) (int, *pathTrie) {
-	if len(segs) == 0 {
-		return 0, t.leaf
-	}
-	seg := segs[len(segs)-1]
-	for _, c := range t.child {
-		if seg == c.piece {
-			n, leaf := c.child.find(segs[:len(segs)-1])
-			return n + 1, leaf
-		}
-	}
-	return 0, t.leaf
-}
-
-type pathTrie struct {
-	child [28]*pathTrie
-
-	name  string       // without trailing slashes
-	leaf  http.Handler // handler for this file/dir
-	strip bool         // whether to strip this prefix
-}
-
-func runeIdx(r rune) int {
-	if r == '/' {
-		return 26
-	}
-	if r >= 'A' && r <= 'Z' {
-		return int(r - 'A')
-	}
-	if r >= 'a' && r <= 'z' {
-		return int(r - 'a')
-	}
-	return 27
-}
-
-func (t *pathTrie) find(path string) (sub int, dir, strip bool, name string, last http.Handler) {
-	s := strings.TrimPrefix(path, "/")
-	add := len(path) - len(s)
-
-	dir, last = add > 0, t.leaf
-	for i, r := range s {
-		next := t.child[runeIdx(r)]
-		if next == nil {
+	// for the insert case, we don't really care as much about efficiency,
+	// so we won't use a binary search for now.
+	var found *Trie
+	for _, child := range t.Child {
+		if child.Name == next {
+			found = child
 			break
 		}
-		t = next
-		if t.leaf != nil {
-			sub, dir, strip, name, last = i+add, r == '/', t.strip, t.name, t.leaf
-			if !dir {
-				sub += utf8.RuneLen(r)
-			}
-		}
 	}
 
-	matched, extra := path[:sub], path[sub:]
-	if matched != name {
-		last = nil
-	} else if len(extra) > 0 {
-		if !dir || extra[0] != '/' {
-			last = nil
+	// Create the node if it wasn't found
+	if found == nil {
+		found = &Trie{
+			Name: next,
 		}
+		t.Child = append(t.Child, found)
+		sort.Sort(byName(t.Child))
 	}
 
-	return sub, dir, strip, name, last
+	// Insert the leaf node
+	if err := found.Insert(paths[1:], leaf); err != nil {
+		if t.Name == "" {
+			return err
+		}
+		return fmt.Errorf("%s: %s", t.Name, err)
+	}
+
+	return nil
 }
 
+// Domain serves the trie for a specific domain.
+type Domain struct {
+	Trie
+
+	// AllowPrefix indicates whether the handlers are equipped
+	// to allow prefix matches.  When it is true, for example,
+	// the path "/base/foo/bar" will be handled by "/base" if
+	// no more specific handlers are registered.
+	AllowPrefix bool
+}
+
+// NewDomain creates a new Domain with no handlers registered.
+func NewDomain() *Domain {
+	return &Domain{
+		Trie: Trie{
+			Leaf: http.HandlerFunc(http.NotFound),
+		},
+	}
+}
+
+// ServeHTTP finds and serves the appropriate handler for the path.
+func (d *Domain) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	cleaned := pathpkg.Clean(r.URL.Path)
+	if strings.HasSuffix(r.URL.Path, "/") {
+		cleaned += "/"
+	}
+
+	// Redirect if the cleaned path differs
+	if r.URL.Path != cleaned {
+		rewrite(w, r, cleaned)
+		return
+	}
+
+	// Find the best handler
+	paths := vaccuum(strings.SplitAfter(r.URL.Path, "/")[1:])
+	n, found := d.Find(paths)
+
+	if n != len(paths) && !strings.HasSuffix(found.Name, "/") {
+		http.NotFound(w, r)
+		return
+	}
+
+	found.Leaf.ServeHTTP(w, r)
+}
+
+// ServeMux serves the tries for all configured domains.
 type ServeMux struct {
-	domain domainTrie
+	Trie
 }
 
+// Handle registers the given handler to be called on requests matching the
+// given pattern.  In general, the pattern takes the following form:
+//   <domain>/<path>
+//
+// Both the domain and the path portions are optional
 func (s *ServeMux) Handle(pattern string, handler http.Handler) {
-	// TODO(kevlar): s.insert
+	// Split the pattern
+	pieces := strings.SplitAfter(pattern, "/")
+	if len(pieces) < 2 {
+		panic(fmt.Sprintf("handle pattern %q is not in <domain>/<path> form", pattern))
+	}
+
+	// Break down the domain and strip empties from the ends
+	pieces[0] = strings.TrimSuffix(pieces[0], "/")
+	domain := vaccuum(strings.Split(pieces[0], "."))
+	reverse(domain)
+
+	// Grab the rest of the pieces as the path and strip empties
+	path := vaccuum(pieces[1:])
+
+	// Helper for inserting at the path and its index if applicable
+	insert := func(t *Trie) {
+		if err := t.Insert(path, handler); err != nil {
+			panic(err)
+		}
+		if strings.HasSuffix(pattern, "/") {
+			// we don't care if this already exists
+			path[len(path)-1] = strings.TrimSuffix(path[len(path)-1], "/")
+			_ = t.Insert(path, http.HandlerFunc(addSlash))
+		}
+	}
+
+	// Find domain
+	n, found := s.Find(domain)
+	if n != len(domain) {
+		d := NewDomain()
+		insert(&d.Trie)
+		s.Insert(domain, d)
+		return
+	}
+	insert(&found.Leaf.(*Domain).Trie)
 }
 
-// TODO(kevlar): SubHandle, like handle but with strip = true
+// NewServeMux creates a new ServeMux with no handlers registered.
+func NewServeMux() *ServeMux {
+	return &ServeMux{
+		Trie: Trie{
+			Leaf: NewDomain(),
+		},
+	}
+}
 
+// HandleFunc is like Handle, but it takes a function compatible with http.HandlerFunc.
 func (s *ServeMux) HandleFunc(pattern string, handler func(http.ResponseWriter, *http.Request)) {
 	s.Handle(pattern, http.HandlerFunc(handler))
 }
 
+// ServeHTTP finds the most appropriate domain handler and serves it.
 func (s *ServeMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// TODO(kevlar): Direct trie? splitFields is the long tail
-	domain := splitFields(r.Host, ".")
-	_, path := s.domain.find(domain)
-
-	clean := pathpkg.Clean(r.URL.Path)
-	matched, _, strip, _, handler := path.find(clean)
-	if handler == nil {
-		// TODO(kevlar): User-defined error pages?
-		http.NotFound(w, r)
+	// Find the best handler
+	domain := strings.Split(r.Host, ".")
+	reverse(domain)
+	n, found := s.Find(domain)
+	if n > 0 && n != len(domain) {
+		domain = domain[:n]
+		reverse(domain)
+		changeHost(w, r, strings.Join(domain, "."))
 		return
 	}
-	if strip {
-		clean = clean[matched:]
-	}
-	if clean == "" {
-		clean = "/"
-	}
-	r.URL.Path = clean
+	found.Leaf.ServeHTTP(w, r)
+}
 
-	handler.ServeHTTP(w, r)
+// changeHost emits a redirect to the same path but with the given host.
+func changeHost(w http.ResponseWriter, r *http.Request, host string) {
+	u := *r.URL
+	u.Host = host
+	u.Scheme = "http"
+	if r.TLS != nil {
+		u.Scheme = "https"
+	}
+	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+// addSlash emits a redirect to the same path but with a trailing slash.
+func addSlash(w http.ResponseWriter, r *http.Request) {
+	u := *r.URL
+	u.Path += "/"
+	http.Redirect(w, r, u.String(), http.StatusFound)
+}
+
+// rewrite emits a redirect to the given path with 301 Moved Permanently.
+func rewrite(w http.ResponseWriter, r *http.Request, path string) {
+	u := *r.URL
+	u.Path = path
+	http.Redirect(w, r, u.String(), http.StatusMovedPermanently)
 }
