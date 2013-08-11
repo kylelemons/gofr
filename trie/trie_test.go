@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/kylelemons/godebug/pretty"
@@ -270,15 +271,19 @@ func TestHandle(t *testing.T) {
 	}
 }
 
-func TestServeHTTP(t *testing.T) {
-	request := func(method, url string) *http.Request {
-		r, err := http.NewRequest(method, url, nil)
-		if err != nil {
-			t.Fatalf("NewRequest(%q, %q): %s", method, url, err)
-		}
-		return r
-	}
+type fataler interface {
+	Fatalf(string, ...interface{})
+}
 
+func request(t fataler, method, url string) *http.Request {
+	r, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(%q, %q): %s", method, url, err)
+	}
+	return r
+}
+
+func TestServeHTTP(t *testing.T) {
 	tests := []struct {
 		desc     string
 		handlers []string
@@ -290,89 +295,89 @@ func TestServeHTTP(t *testing.T) {
 		{
 			desc:     "basic",
 			handlers: []string{"/foo"},
-			req:      request("GET", "http://example.com/foo"),
+			req:      request(t, "GET", "http://example.com/foo"),
 			code:     200,
 			body:     "/foo handler",
 		},
 		{
 			desc:     "basic with domain",
 			handlers: []string{"example.com/foo"},
-			req:      request("GET", "http://example.com/foo"),
+			req:      request(t, "GET", "http://example.com/foo"),
 			code:     200,
 			body:     "example.com/foo handler",
 		},
 		{
 			desc:     "other domain",
 			handlers: []string{"example.com/foo"},
-			req:      request("GET", "http://example.net/foo"),
+			req:      request(t, "GET", "http://example.net/foo"),
 			code:     404,
 		},
 		{
 			desc:     "sub domain",
 			handlers: []string{"example.com/foo"},
-			req:      request("GET", "http://www.example.com/foo"),
+			req:      request(t, "GET", "http://www.example.com/foo"),
 			code:     302,
 			redir:    "http://example.com/foo",
 		},
 		{
 			desc:     "sub domain query",
 			handlers: []string{"example.com/foo"},
-			req:      request("GET", "http://www.example.com/foo?q"),
+			req:      request(t, "GET", "http://www.example.com/foo?q"),
 			code:     302,
 			redir:    "http://example.com/foo?q",
 		},
 		{
 			desc:     "dir",
 			handlers: []string{"/dir/"},
-			req:      request("GET", "/dir/"),
+			req:      request(t, "GET", "/dir/"),
 			code:     200,
 			body:     "/dir/ handler",
 		},
 		{
 			desc:     "file in non-dir",
 			handlers: []string{"/foo"},
-			req:      request("GET", "/foo/sub"),
+			req:      request(t, "GET", "/foo/sub"),
 			code:     404,
 		},
 		{
 			desc:     "file in dir",
 			handlers: []string{"/dir/"},
-			req:      request("GET", "/dir/foo/bar"),
+			req:      request(t, "GET", "/dir/foo/bar"),
 			code:     200,
 			body:     "/dir/ handler",
 		},
 		{
 			desc:     "dir redir",
 			handlers: []string{"/dir/"},
-			req:      request("GET", "/dir"),
+			req:      request(t, "GET", "/dir"),
 			code:     302,
 			redir:    "/dir/",
 		},
 		{
 			desc:     "dir redir query",
 			handlers: []string{"/dir/"},
-			req:      request("GET", "/dir?foo"),
+			req:      request(t, "GET", "/dir?foo"),
 			code:     302,
 			redir:    "/dir/?foo",
 		},
 		{
 			desc:     "no dir redir",
 			handlers: []string{"/dir", "/dir/"},
-			req:      request("GET", "/dir"),
+			req:      request(t, "GET", "/dir"),
 			code:     200,
 			body:     "/dir handler",
 		},
 		{
 			desc:     "clean",
 			handlers: []string{"/foo/bar"},
-			req:      request("GET", "/foo/baz/../bar"),
+			req:      request(t, "GET", "/foo/baz/../bar"),
 			code:     301,
 			redir:    "/foo/bar",
 		},
 		{
 			desc:     "clean query",
 			handlers: []string{"/foo/bar"},
-			req:      request("GET", "/foo/baz/../bar?q"),
+			req:      request(t, "GET", "/foo/baz/../bar?q"),
 			code:     301,
 			redir:    "/foo/bar?q",
 		},
@@ -402,14 +407,140 @@ func TestServeHTTP(t *testing.T) {
 	}
 }
 
-func benchMux(b *testing.B, mux http.Handler) {
+func perms(length int, f func([]int)) {
+	idx := make([]int, length)
+	for i := range idx {
+		idx[i] = i
+	}
+	for {
+		f(idx)
+		if len(idx) < 2 {
+			break
+		}
+		k := len(idx) - 2
+		for k >= 0 {
+			if idx[k] < idx[k+1] {
+				goto foundK
+			}
+			k--
+		}
+		break
+	foundK:
+		l := len(idx) - 1
+		for l >= 0 {
+			if idx[k] < idx[l] {
+				goto foundL
+			}
+			l--
+		}
+	foundL:
+		idx[k], idx[l] = idx[l], idx[k]
+		i, j := k+1, len(idx)-1
+		for ; i < j; i, j = i+1, j-1 {
+			idx[i], idx[j] = idx[j], idx[i]
+		}
+	}
+}
+
+var benchPrefixes = []string{
+	"",
+	"golang.org",
+	"example.com",
+}
+
+var benchPieces = []string{
+	"/foo",
+	"/dir",
+	"/sub",
+	"/go",
+	"/python",
+	"/spam",
+	"/eggs!",
+}
+
+var benchSuffixes = []string{
+	"",
+	"/",
+}
+
+var benchRequests = []string{
+	"/foo",
+	"/foo/",
+	"/foo/bar",
+	"/foo/bar/",
+	"/dir",
+	"/dir/",
+	"/dir/sub",
+	"http://example.com/",
+	"http://example.com/sub/",
+	"http://example.com/sub/dir/",
+	"http://example.com/sub/dir/file",
+}
+
+type serveMux interface {
+	http.Handler
+	Handle(string, http.Handler)
+}
+
+type nullHandler struct{}
+
+func (nullHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func benchMux(b *testing.B, depth int, mux serveMux) {
+	var count int
+	for _, pre := range benchPrefixes {
+		for _, suff := range benchSuffixes {
+			for d := 1; d <= depth; d++ {
+				s := make([]string, d)
+				perms(d, func(idx []int) {
+					for i, j := range idx {
+						s[i] = benchPieces[j]
+					}
+					h := pre + strings.Join(s, "") + suff
+					mux.Handle(h, nullHandler{})
+					count++
+				})
+			}
+		}
+	}
+	if b.N == 1 {
+		b.Logf("Benchmarking with %d handlers", count)
+	}
+	var reqs []*http.Request
+	for _, u := range benchRequests {
+		reqs = append(reqs, request(b, "GET", u))
+	}
+
 	b.ReportAllocs()
 	b.ResetTimer()
-	reqs := []*http.Request{}
+
+	rw := httptest.NewRecorder()
 	for i := 0; i < b.N; i += len(reqs) {
 		for _, req := range reqs {
-			rw := httptest.NewRecorder()
 			mux.ServeHTTP(rw, req)
 		}
 	}
 }
+
+func BenchmarkTrieServeMux1(b *testing.B) { benchMux(b, 1, NewServeMux()) }
+func BenchmarkHTTPServeMux1(b *testing.B) { benchMux(b, 1, http.NewServeMux()) }
+func BenchmarkTrieServeMux2(b *testing.B) { benchMux(b, 2, NewServeMux()) }
+func BenchmarkHTTPServeMux2(b *testing.B) { benchMux(b, 2, http.NewServeMux()) }
+func BenchmarkTrieServeMux3(b *testing.B) { benchMux(b, 3, NewServeMux()) }
+func BenchmarkHTTPServeMux3(b *testing.B) { benchMux(b, 3, http.NewServeMux()) }
+func BenchmarkTrieServeMux4(b *testing.B) { benchMux(b, 4, NewServeMux()) }
+func BenchmarkHTTPServeMux4(b *testing.B) { benchMux(b, 4, http.NewServeMux()) }
+func BenchmarkTrieServeMux5(b *testing.B) { benchMux(b, 5, NewServeMux()) }
+func BenchmarkHTTPServeMux5(b *testing.B) { benchMux(b, 5, http.NewServeMux()) }
+
+//func BenchmarkTrieServeMux6(b *testing.B) { benchMux(b, 6, NewServeMux()) }
+//func BenchmarkHTTPServeMux6(b *testing.B) { benchMux(b, 6, http.NewServeMux()) }
+//func BenchmarkTrieServeMux7(b *testing.B) { benchMux(b, 7, NewServeMux()) }
+//func BenchmarkHTTPServeMux7(b *testing.B) { benchMux(b, 7, http.NewServeMux()) }
