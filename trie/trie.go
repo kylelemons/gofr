@@ -129,12 +129,6 @@ func (t *Trie) Insert(paths []string, leaf http.Handler) error {
 // Domain serves the trie for a specific domain.
 type Domain struct {
 	Trie
-
-	// AllowPrefix indicates whether the handlers are equipped
-	// to allow prefix matches.  When it is true, for example,
-	// the path "/base/foo/bar" will be handled by "/base" if
-	// no more specific handlers are registered.
-	AllowPrefix bool
 }
 
 // NewDomain creates a new Domain with no handlers registered.
