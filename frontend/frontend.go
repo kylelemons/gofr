@@ -222,7 +222,7 @@ type ServeMux interface {
 }
 
 // A Frontend manages backends and other handlers for this frontend.
-// The zero Frontend is ready for use.
+// The zero value of all unexported fields are already for use.
 type Frontend struct {
 	// Frontend configuration
 	DebugIPs []*net.IPNet // IP networks allowed to access the debug handlers
@@ -234,6 +234,13 @@ type Frontend struct {
 	backends []*Backend
 }
 
+// NewFrontend returns a frontend with a standard http.ServeMux and no DebugIPs.
+func NewFrontend() *Frontend {
+	return &Frontend{
+		ServeMux: http.NewServeMux(),
+	}
+}
+
 // HandleDebug registers the following handlers:
 //   /__backends   - backend information (ListBackends)
 func (f *Frontend) HandleDebug() {
@@ -242,26 +249,38 @@ func (f *Frontend) HandleDebug() {
 
 // Debug serves 404 except for source IPs in the DebugIPs set.
 func (f *Frontend) Debug(h http.Handler) http.HandlerFunc {
+	blocked := func(r *http.Request, format string, args ...interface{}) {
+		err := fmt.Sprintf(format, args...)
+		daemon.Warning.Printf("[%s] BLOCKED debug access to %s: %s", r.RemoteAddr, r.URL.Path, err)
+	}
+	allowed := func(r *http.Request, format string, args ...interface{}) {
+		err := fmt.Sprintf(format, args...)
+		daemon.Verbose.Printf("[%s] Allowed debug access to %s: %s", r.RemoteAddr, r.URL.Path, err)
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		rawIP, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
+			blocked(r, "failed to split addr: %s", err)
 			http.NotFound(w, r)
 			return
 		}
 
 		ip := net.ParseIP(rawIP)
 		if ip == nil {
+			blocked(r, "%q could not be parsed: %s", rawIP, err)
 			http.NotFound(w, r)
 			return
 		}
 
 		for _, net := range f.DebugIPs {
 			if net.Contains(ip) {
-				daemon.Verbose.Printf("Debug access to %q allowed: %s is present in %s", r.URL.Path, ip, net)
+				allowed(r, "debug network %s", net)
 				h.ServeHTTP(w, r)
 				return
 			}
 		}
+
+		blocked(r, "%s is not in the debug IP range", ip)
 		http.NotFound(w, r)
 	}
 }

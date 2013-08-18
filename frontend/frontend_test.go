@@ -18,13 +18,20 @@ import (
 	"crypto/tls"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	urlpkg "net/url"
 	"reflect"
 	"strings"
 	"testing"
+
+	"kylelemons.net/go/daemon"
 )
+
+func init() {
+	daemon.LogLevel = daemon.Verbose
+}
 
 type FuncTripper func(*http.Request) (*http.Response, error)
 
@@ -144,19 +151,57 @@ func TestBackendRequest(t *testing.T) {
 			}, nil
 		})
 		req, err := http.NewRequest("GET", "/foo?q", test.body)
+		if err != nil {
+			t.Fatalf("%s: NewRequest(%q, %q, %#v): %s", test.desc, "GET", "/foo?q", test.body, err)
+		}
 		req.Host = "fakehost"
 		req.RemoteAddr = "1.2.3.4:5678"
 		req.Header = test.header
 		req.TLS = &tls.ConnectionState{}
-		if err != nil {
-			t.Fatalf("%s: NewRequest(%q, %q, %#v): %s", test.desc, "GET", "/foo", test.body, err)
-		}
 		rec := httptest.NewRecorder()
 		b.ServeHTTP(rec, req)
 		for k, v := range test.afterHeader {
 			if got, want := rec.HeaderMap[k], v; !reflect.DeepEqual(got, want) {
 				t.Errorf("%s: after header[%q] = %#v, want %#v", test.desc, k, got, want)
 			}
+		}
+	}
+}
+
+func TestDebug(t *testing.T) {
+	fe := NewFrontend()
+	fe.DebugIPs = LocalDebugIPs
+	fe.HandleDebug()
+
+	tests := []struct {
+		ip   string
+		code int
+	}{
+		{
+			ip:   "127.0.0.1",
+			code: 200,
+		},
+		{
+			ip:   "fe80::A:0:0:1:2",
+			code: 200,
+		},
+		{
+			ip:   "188.14.109.23",
+			code: 404,
+		},
+	}
+
+	for _, test := range tests {
+		req, err := http.NewRequest("GET", "/__backends", nil)
+		if err != nil {
+			t.Fatalf("NewRequest(%q, %q, %#v): %s", "GET", "/foo?q", nil, err)
+		}
+		req.RemoteAddr = net.JoinHostPort(test.ip, "1224")
+		rec := httptest.NewRecorder()
+		fe.ServeHTTP(rec, req)
+		if got, want := rec.Code, test.code; got != want {
+			t.Errorf("from %q: code = %d %s, want %d %s",
+				test.ip, got, http.StatusText(got), want, http.StatusText(want))
 		}
 	}
 }
