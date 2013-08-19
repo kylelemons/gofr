@@ -18,22 +18,24 @@
 package frontend
 
 import (
+	"encoding/gob"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
 	"net/http"
 	urlpkg "net/url"
+	"strconv"
 	"sync"
 	"time"
 
 	"kylelemons.net/go/daemon"
 )
 
-// A Backend handles routing requests to a backend.  The zero
+// An Endpoint handles routing requests to a backend.  The zero
 // values of all unexported fields and of all map fields are
 // safe to use.  No unexported fields may be modified after
-// the Backend begins to serve traffic.
+// the Endpoint begins to serve traffic.
 //
 // The following are used to construct the backend request:
 //   Method              - Unmodified
@@ -67,7 +69,7 @@ import (
 //   Content-MD5, Via, Connection
 //
 // Any other headers will log a warning before being discarded.
-type Backend struct {
+type Endpoint struct {
 	// Basic backend configuration
 	Name string // name of this backend (shown in __backends)
 	Root string
@@ -77,7 +79,7 @@ type Backend struct {
 	StripHeader   map[string]bool
 	BodySizeLimit int64
 
-	// Transport for making requests.  HandleBackend will set
+	// Transport for making requests.  HandleEndpoint will set
 	// this to http.DefaultTransport if it is nil.
 	http.RoundTripper
 
@@ -86,7 +88,7 @@ type Backend struct {
 }
 
 // ServeHTTP proxies the request to the backend.
-func (b *Backend) ServeHTTP(w http.ResponseWriter, original *http.Request) {
+func (b *Endpoint) ServeHTTP(w http.ResponseWriter, original *http.Request) {
 	start := time.Now()
 
 	// Choose a backend
@@ -230,12 +232,12 @@ type Frontend struct {
 	// Requests are handled by this ServeMux
 	ServeMux
 
-	lock     sync.RWMutex
-	backends []*Backend
+	lock      sync.RWMutex
+	endpoints []*Endpoint
 }
 
-// NewFrontend returns a frontend with a standard http.ServeMux and no DebugIPs.
-func NewFrontend() *Frontend {
+// New returns a frontend with a standard http.ServeMux and no DebugIPs.
+func New() *Frontend {
 	return &Frontend{
 		ServeMux: http.NewServeMux(),
 	}
@@ -291,7 +293,7 @@ func (f *Frontend) ListBackends(w http.ResponseWriter, r *http.Request) {
 
 	f.lock.RLock()
 	defer f.lock.RUnlock()
-	for _, b := range f.backends {
+	for _, b := range f.endpoints {
 		fmt.Fprintf(w, "Backend %q at %q:\n", b.Name, b.Root)
 		b.lock.RLock()
 		for _, u := range b.hosts {
@@ -301,13 +303,13 @@ func (f *Frontend) ListBackends(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// HandleBackend registers the given backend at its specified Root.
-func (f *Frontend) HandleBackend(b *Backend) {
+// HandleEndpoint registers the given endpoint at its specified Root.
+func (f *Frontend) HandleEndpoint(b *Endpoint) {
 	if b.RoundTripper == nil {
 		b.RoundTripper = http.DefaultTransport
 	}
 
-	f.backends = append(f.backends, b)
+	f.endpoints = append(f.endpoints, b)
 	f.Handle(b.Root, b)
 }
 
@@ -329,20 +331,163 @@ func MustCIDR(cidr string) *net.IPNet {
 
 // Types for the inter-process communication between frontend and backend.
 type (
-	// RegisterBackend is sent by backend upon connection.
+	// RegisterBackend is sent by backend upon connection.  The backend is assumed
+	// to be served from the source port of the incoming connection.
 	RegisterBackend struct {
-		Name string
-		URL  *urlpkg.URL
+		Name string // name of endpoint to join
+		Host string // source IP assumed if empty
+		Port int    // port number (required)
 	}
 
 	// Status is sent from the frontend to the backend with a Nonce,
 	// after which the Status is sent back to the frontend with the
 	// same Nonce and an up-to-date Status.
 	Status struct {
-		Nonce  string // must match response
-		Status string
+		Nonce int64 // must match response
 	}
 )
+
+// ServeBackends serves backend handling connections accepted from the given Listener.
+// This function should be run in its own goroutine.
+func (f *Frontend) ServeBackends(l net.Listener, pingDelay time.Duration) error {
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := f.ServeBackend(conn, pingDelay); err != nil {
+				daemon.Verbose.Printf("[%s] backend connection failed: %s", conn.RemoteAddr(), err)
+			}
+		}()
+	}
+}
+
+func (f *Frontend) addBackend(name string, url *urlpkg.URL) error {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+
+	for _, b := range f.endpoints {
+		if b.Name == name {
+			b.lock.Lock()
+			defer b.lock.Unlock()
+			b.hosts = append(b.hosts, url)
+			daemon.Info.Printf("New %q backend: %s", name, url)
+			return nil
+		}
+	}
+	return fmt.Errorf("unknown backend %q", name)
+}
+
+func (f *Frontend) delBackend(name string, url *urlpkg.URL) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+
+	for _, b := range f.endpoints {
+		if b.Name == name {
+			b.lock.Lock()
+			defer b.lock.Unlock()
+			for i, u := range b.hosts {
+				if u == url { // deliberate pointer compare
+					b.hosts = append(b.hosts[:i], b.hosts[i+1:]...)
+					daemon.Info.Printf("Closed %q backend: %s", name, url)
+					return
+				}
+			}
+			daemon.Warning.Printf("Could not find %q backend url %q to close", name, url)
+			return
+		}
+	}
+	daemon.Warning.Printf("Could not find %q backend to close", name)
+}
+
+// Sleepish sleeps for approximately the given duration.  It will sleep
+// somewhere (pseudo-randomly, normally distributed) +/- 50% of the given sleep
+// time.
+//
+// It is a variable to facilitate instant testing; it shoulg not generally need
+// to be swapped out.
+var Sleepish = func(dur time.Duration) {
+	const StdDev = 0.15
+	const Min, Max = 0.5, 1.5
+
+	fuzz := 1 + rand.NormFloat64()*StdDev
+	if fuzz > Max {
+		fuzz = Max
+	} else if fuzz < Min {
+		fuzz = Min
+	}
+
+	sleep(time.Duration(float64(dur) * fuzz))
+}
+
+// sleep is replaced for internal testing only.
+var sleep = time.Sleep
+
+// ServeBackend handles the given backend connection.
+func (f *Frontend) ServeBackend(conn net.Conn, pingDelay time.Duration) error {
+	defer conn.Close()
+
+	enc := gob.NewEncoder(conn)
+	dec := gob.NewDecoder(conn)
+
+	// Handshake: RegisterBackend
+	var reg RegisterBackend
+	if err := dec.Decode(&reg); err != nil {
+		return fmt.Errorf("handshake failed: %s", err)
+	}
+
+	daemon.Info.Printf("Backend %q connecting from %s", reg.Name, conn.RemoteAddr())
+
+	if reg.Host == "" {
+		// This needs to be a TCPAddr
+		addr, ok := conn.RemoteAddr().(*net.TCPAddr)
+		if !ok {
+			got := conn.RemoteAddr()
+			return fmt.Errorf("cannot infer source address from %T: %#v", got, got)
+		}
+		reg.Host = addr.IP.String()
+	}
+
+	url := urlpkg.URL{
+		Scheme: "http", // TODO(kevlar): allow backend to request HTTPS?
+		Host:   net.JoinHostPort(reg.Host, strconv.Itoa(reg.Port)),
+	}
+
+	if err := f.addBackend(reg.Name, &url); err != nil {
+		return err
+	}
+	defer f.delBackend(reg.Name, &url)
+
+	for {
+		Sleepish(pingDelay)
+
+		ping := &Status{
+			Nonce: rand.Int63(),
+		}
+		start := time.Now()
+		if err := enc.Encode(ping); err != nil {
+			if err == io.EOF || err == io.ErrClosedPipe {
+				break
+			}
+			return fmt.Errorf("ping failed: %s", err)
+		}
+
+		var pong Status
+		if err := dec.Decode(&pong); err != nil {
+			if err == io.EOF || err == io.ErrClosedPipe {
+				break
+			}
+			return fmt.Errorf("pong decode: %s", err)
+		}
+		daemon.Verbose.Printf("[%s] ping time: %s", conn.RemoteAddr(), time.Since(start))
+
+		if got, want := pong.Nonce, ping.Nonce; got != want {
+			return fmt.Errorf("ping/pong mismatch: nonce = %d, want %d", got, want)
+		}
+	}
+	return nil
+}
 
 // LocalDebugIPs contains the standard "private" IPv4 and IPv6 networks.
 // It can be used with Frontend.DebugIPs.

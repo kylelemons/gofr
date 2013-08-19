@@ -25,6 +25,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"kylelemons.net/go/daemon"
 )
@@ -39,8 +40,8 @@ func (f FuncTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
 }
 
-func TestBackendRequest(t *testing.T) {
-	b := &Backend{
+func TestEndpointRequest(t *testing.T) {
+	b := &Endpoint{
 		Name:          "test",
 		Root:          "/test",
 		AllowHeader:   map[string]bool{"AllowThis": true},
@@ -169,7 +170,7 @@ func TestBackendRequest(t *testing.T) {
 }
 
 func TestDebug(t *testing.T) {
-	fe := NewFrontend()
+	fe := New()
 	fe.DebugIPs = LocalDebugIPs
 	fe.HandleDebug()
 
@@ -204,4 +205,34 @@ func TestDebug(t *testing.T) {
 				test.ip, got, http.StatusText(got), want, http.StatusText(want))
 		}
 	}
+}
+
+func TestSleepish(t *testing.T) {
+	defer func(orig func(time.Duration)) {
+		sleep = orig
+	}(sleep)
+
+	var times []time.Duration
+	sleep = func(d time.Duration) {
+		times = append(times, d)
+	}
+
+	for i := 0; i < 1000; i++ {
+		Sleepish(1 * time.Second)
+	}
+
+	var buckets [11]int
+	for _, d := range times {
+		switch {
+		case d < 500*time.Millisecond:
+			t.Errorf("Found sleep for %s - too short!", d)
+		case d > 1500*time.Millisecond:
+			t.Errorf("Found sleep for %s - too long!", d)
+		default:
+			bucket := int((d-500*time.Millisecond)/time.Millisecond) / 100
+			buckets[bucket]++
+		}
+	}
+	// Output should approximate the heights of a bell curve
+	t.Logf("Sleep breakdown: %v", buckets)
 }
